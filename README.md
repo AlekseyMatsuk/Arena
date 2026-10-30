@@ -155,6 +155,8 @@ loadout_kits:
     health_override: 0
     ahp_override: 0
 ```
+Support
+<a href="https://discord.gg/jbjkWYYt2V"><img src="https://www.allkpop.com/upload/2021/01/content/262046/1611711962-discord-button.png" height="80"></a>
 
 ---
 
