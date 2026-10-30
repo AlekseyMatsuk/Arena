@@ -23,46 +23,10 @@ A modular, C# 7.3 compatible 1v1 PvP Arena plugin for SCP: Secret Laboratory ser
 
 ---
 
-## Repository Structure
-
-| File | Description |
-| :--- | :--- |
-| `Arena1v1Plugin.cs` | Main LabAPI plugin containing `ArenaLoadoutSet`, `ArenaConfig`, `.arena` client command, Remote Admin `arena` command, pool rotation, and combat handlers. |
-| `ArenaStats.cs` | Optional persistent statistics and leaderboard module (`.stats`, `.top`, Remote Admin `arenastats`, and `Arena1v1Stats.json` writer). |
-| `Arena1v1.json` | Dedicated 1v1 tactical arena schematic for ProjectMER (high-visibility light-grey geometry, 16 lights, 6 physics colliders, symmetrical North/South spawn bunkers). |
-| `Arena1v1Plugin.csproj` | .NET Framework 4.8 project file for building the plugin with Visual Studio or the .NET SDK. |
-
----
-
-## Building from Source
-
-### Prerequisites
-
-- .NET Framework 4.8 Developer Pack (or .NET SDK)
-- Visual Studio 2022 or JetBrains Rider
-- Reference assemblies from your SCP:SL Dedicated Server (`SCPSL_Data/Managed/`):
-  - `Assembly-CSharp.dll`
-  - `Assembly-CSharp-firstpass.dll` (for MEC coroutines)
-  - `CommandSystem.Core.dll`
-  - `LabApi.dll` (or via NuGet package `Northwood.LabAPI`)
-  - `Mirror.dll`
-  - `UnityEngine.CoreModule.dll`
-
-### Build Steps
-
-1. Clone the repository and place the required server DLLs into a `References/` folder next to `Arena1v1Plugin.csproj` (or update the `HintPath` entries).
-2. Keep both `Arena1v1Plugin.cs` and `ArenaStats.cs` in the project to compile a single unified `Arena1v1Plugin.dll` (or compile `Arena1v1Plugin.cs` standalone).
-3. Run:
-
-```bash
-dotnet build -c Release
-```
-
----
 
 ## Installation on Server
 
-1. Copy the compiled `Arena1v1Plugin.dll` into your server's LabAPI plugins directory:
+1. Copy the compiled `Arena.dll` into your server's LabAPI plugins directory:
    `LabApi/plugins/global/` (or your server port folder).
 2. If you use **ProjectMER**, copy `Arena1v1.json` into your ProjectMER schematics folder:
    `ProjectMER/Schematics/Arena1v1/Arena1v1.json` (or `AppData/Roaming/SCP Secret Laboratory/LabAPI/configs/ProjectMER/Schematics/` depending on your ProjectMER version).
