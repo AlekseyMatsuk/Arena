@@ -111,7 +111,7 @@ auto_spawn_schematic: true
 schematic_name: "Arena1v1"
 arena_origin:
   x: 180.0
-  y: 1000.0
+  y: 200.0
   z: -60.0
 player1_spawn_offset:
   x: 0.00
