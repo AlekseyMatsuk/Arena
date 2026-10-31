@@ -8,14 +8,14 @@
 //    ArenaConfig.LoadoutKits (Shotgunner, Facility Guard, Pistol Duelist,
 //    MTF Rifleman, Chaos Insurgent, SpecOps SMG, Heavy Gunner). Server owners
 //    can edit, disable, or add new kits in the LabAPI YAML config file.
-// 2. Dynamic 3+ Player Arena Pool: Spectators join via .arena. When 3 or more
-//    players are in the pool, 2 fighters are selected each round (prioritizing
-//    players who waited on the spectator bench in the previous round).
+// 2. Dynamic 3+ Player & Bot Arena Pool: Tracks participants by unique PlayerId
+//    so both real players and multiple bots/dummies (with empty UserIds or
+//    identical nicknames) rotate cleanly into the next round in FIFO order.
 // 3. Remote Admin Subcommands: Client console (~) only exposes .arena. All admin
-//    and testing subcommands (solo, add, win, set, setp1, setp2, stop) are
-//    restricted to the Remote Admin console (M).
+//    and testing subcommands (solo, add, pool, win, set, kits, setp1, setp2, stop)
+//    are restricted to the Remote Admin console (M).
 // 4. Optional Integrations via Reflection:
-//    - ProjectMER (auto-spawns the Arena1v1 schematic at ArenaOrigin)
+//    - ProjectMER (auto-spawns the Arena1v1 schematic at ArenaOrigin Y=200)
 //    - MedveMarci/XpSystem (awards configurable XP on round win/loss)
 //    - ArenaStats.cs (persists player stats & leaderboard to Arena1v1Stats.json)
 // ============================================================================
@@ -102,8 +102,8 @@ namespace Arena1v1
         [Description("ProjectMER schematic name (place Arena1v1.json inside ProjectMER schematics folder).")]
         public string SchematicName { get; set; } = "Arena1v1";
 
-        [Description("World coordinates where the arena schematic center is spawned.")]
-        public Vector3 ArenaOrigin { get; set; } = new Vector3(180.0f, 1000.0f, -60.0f);
+        [Description("World coordinates where the arena schematic center is spawned (Y=200 avoids height limit issues).")]
+        public Vector3 ArenaOrigin { get; set; } = new Vector3(180.0f, 200.0f, -60.0f);
 
         [Description("Local spawn offset for Fighter 1 relative to ArenaOrigin (South Bunker Z = -13.5).")]
         public Vector3 Player1SpawnOffset { get; set; } = new Vector3(0.00f, 1.25f, -13.50f);
@@ -124,8 +124,11 @@ namespace Arena1v1
         [Description("Role assigned to active arena fighters (Tutorial is recommended so duels do not block round end).")]
         public RoleTypeId DuelRole { get; set; } = RoleTypeId.Tutorial;
 
-        [Description("Allow players to join the arena pool via .arena only when they are in Spectator role.")]
+        [Description("Allow players to join the arena pool via .arena only when they are in Spectator (or Tutorial/Overwatch).")]
         public bool OnlySpectatorsCanJoin { get; set; } = true;
+
+        [Description("Automatically remove waiting players from the arena pool if a main facility respawn wave spawns them.")]
+        public bool RemoveFromPoolOnMainRoundSpawn { get; set; } = false;
 
         [Description("Maximum number of players allowed in the arena rotation pool at the same time (0 = unlimited).")]
         public int MaxPoolSize { get; set; } = 16;
@@ -139,7 +142,7 @@ namespace Arena1v1
         [Description("Delay in seconds after a round ends before spawning the next pair of fighters.")]
         public float RematchDelaySeconds { get; set; } = 2.5f;
 
-        [Description("Delay in seconds after changing player role before teleporting and equipping items.")]
+        [Description("Delay in seconds after changing player role before equipping items.")]
         public float EquipDelaySeconds { get; set; } = 0.15f;
 
         [Description("Duration in seconds for in-game HUD hints sent by the arena plugin.")]
@@ -178,7 +181,7 @@ namespace Arena1v1
         public bool EnableStatsRecording { get; set; } = true;
 
         // --- Loadout Kits & Fallback Equipment ---
-        [Description("Select a random kit from LoadoutKits every round (if false, uses DefaultPrimaryWeapon/SecondaryWeapon below).")]
+        [Description("Select a random kit from LoadoutKits every round (if false, uses PrimaryWeapon/SecondaryWeapon below).")]
         public bool UseRandomLoadoutSets { get; set; } = true;
 
         [Description("Prevent the same loadout kit from being randomly selected twice in a row.")]
@@ -364,7 +367,8 @@ namespace Arena1v1
     // 3B. REMOTE ADMIN COMMAND (arena in Remote Admin console M)
     //     All administrative and testing subcommands:
     //     - arena solo [ID/Name]       -> spawn in solo test mode on the arena
-    //     - arena add <ID/Name>        -> force-add a player to the arena/pool
+    //     - arena add <ID/Name|bot>    -> force-add a player or bot to the arena/pool
+    //     - arena pool                 -> inspect active fighters and waiting bench queue
     //     - arena win [ID/Name]        -> award a round win (+XP and stats record)
     //     - arena set <index|id|random>-> force a specific kit or restore random rotation
     //     - arena kits                 -> list all configured loadout kits
@@ -376,7 +380,7 @@ namespace Arena1v1
     {
         public string Command => "arena";
         public string[] Aliases => new[] { "arenaadmin", "1v1admin" };
-        public string Description => "Manage the 1v1 Arena (solo, add, win, set, kits, setp1, setp2, stop)";
+        public string Description => "Manage the 1v1 Arena (solo, add, pool, win, set, kits, setp1, setp2, stop)";
 
         public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
         {
@@ -392,13 +396,14 @@ namespace Arena1v1
             {
                 response =
                     "[RemoteAdmin - Arena1v1] Available subcommands:\n" +
-                    "- arena solo [ID/Name] : Spawn in solo arena test mode\n" +
-                    "- arena add <ID/Name>  : Force-add a player to the arena or rotation pool\n" +
-                    "- arena win [ID/Name]  : Trigger round victory (+XP and stats record)\n" +
-                    "- arena set <id|num|random> : Force a specific loadout kit or reset to random\n" +
-                    "- arena kits           : List all configured loadout kits\n" +
-                    "- arena setp1 / setp2  : Save Fighter 1 or Fighter 2 spawn at your current position\n" +
-                    "- arena stop           : Stop active duel and clear the arena pool";
+                    "- arena solo [ID/Name]       : Spawn in solo arena test mode\n" +
+                    "- arena add <ID/Name|bot>    : Force-add a player or bot to the arena or rotation pool\n" +
+                    "- arena pool                 : View current active fighters and waiting pool queue\n" +
+                    "- arena win [ID/Name]        : Trigger round victory (+XP and stats record)\n" +
+                    "- arena set <id|num|random>  : Force a specific loadout kit or reset to random\n" +
+                    "- arena kits                 : List all configured loadout kits\n" +
+                    "- arena setp1 / setp2        : Save Fighter 1 or Fighter 2 spawn at your current position\n" +
+                    "- arena stop                 : Stop active duel and clear the arena pool";
                 return true;
             }
 
@@ -407,6 +412,11 @@ namespace Arena1v1
             if (sub == "kits" || sub == "list")
             {
                 return Arena1v1Plugin.Instance.ListConfiguredKits(out response);
+            }
+
+            if (sub == "pool" || sub == "status" || sub == "queue")
+            {
+                return Arena1v1Plugin.Instance.InspectArenaPool(out response);
             }
 
             if (sub == "solo" || sub == "test" || sub == "1")
@@ -430,7 +440,7 @@ namespace Arena1v1
             {
                 if (arguments.Count < 2)
                 {
-                    response = "[RA - Arena1v1] Please specify a player ID or nickname: arena add <ID/Name>";
+                    response = "[RA - Arena1v1] Please specify a player ID, nickname, or 'bot': arena add <ID/Name|bot>";
                     return false;
                 }
 
@@ -438,7 +448,7 @@ namespace Arena1v1
                 Player target = Arena1v1Plugin.Instance.FindTargetPlayer(targetQuery, adminPlayer);
                 if (target == null)
                 {
-                    response = $"[RA - Arena1v1] Player '{targetQuery}' was not found.";
+                    response = $"[RA - Arena1v1] Player or bot '{targetQuery}' was not found.";
                     return false;
                 }
 
@@ -514,25 +524,31 @@ namespace Arena1v1
         public static Arena1v1Plugin Instance { get; private set; }
 
         public override string Name => "Arena1v1";
-        public override string Description => "1v1 PvP Arena with configurable kits, 3+ player pool rotation, XpSystem and stats integration";
+        public override string Description => "1v1 PvP Arena with configurable kits, 3+ player/bot pool rotation, XpSystem and stats integration";
         public override string Author => "Arena1v1 Studio";
-        public override Version Version => new Version(3, 0, 0);
+        public override Version Version => new Version(3, 1, 0);
         public override Version RequiredApiVersion => new Version(1, 0, 0);
 
         private sealed class ActiveDuelSession
         {
+            public int Player1Id { get; set; } = -1;
+            public int Player2Id { get; set; } = -1;
             public string Player1UserId { get; set; } = string.Empty;
             public string Player2UserId { get; set; } = string.Empty;
+            public int LastWinnerId { get; set; } = -1;
+            public int LastLoserId { get; set; } = -1;
             public int CurrentRound { get; set; } = 1;
+            public float RoundStartTime { get; set; }
             public bool IsRespawningBetweenRounds { get; set; }
             public CoroutineHandle RematchCoroutine { get; set; }
             public ArenaLoadoutSet CurrentLoadout { get; set; }
 
-            public bool IsSoloSession => string.IsNullOrEmpty(Player2UserId);
+            public bool IsSoloSession => Player2Id <= 0;
         }
 
-        // Participant pool (supports 2, 3, 4+ players with automatic bench rotation)
-        private readonly List<string> _arenaParticipants = new List<string>();
+        // Participant pool tracked by unique int PlayerId (supports real players AND multiple bots/dummies!)
+        private readonly List<int> _arenaParticipants = new List<int>();
+        private readonly HashSet<int> _forceAddedParticipants = new HashSet<int>();
         private readonly Dictionary<string, int> _playerWins = new Dictionary<string, int>();
         private readonly System.Random _rng = new System.Random();
 
@@ -599,19 +615,56 @@ namespace Arena1v1
             return role == RoleTypeId.Spectator || role == RoleTypeId.Overwatch;
         }
 
-        private int GetPlayerWins(string userId)
+        private static bool IsBotOrDummy(Player player)
         {
-            if (string.IsNullOrEmpty(userId))
-                return 0;
-            return _playerWins.TryGetValue(userId, out int w) ? w : 0;
+            if (player == null)
+                return false;
+            return string.IsNullOrEmpty(player.UserId) ||
+                   player.UserId == "ID_Dedicated" ||
+                   player.UserId.StartsWith("Dummy", StringComparison.OrdinalIgnoreCase);
         }
 
-        private int IncrementPlayerWins(string userId)
+        public static string GetStatsKey(Player player)
         {
-            if (string.IsNullOrEmpty(userId))
+            if (player == null)
+                return string.Empty;
+            if (!string.IsNullOrEmpty(player.UserId) && player.UserId != "ID_Dedicated")
+                return player.UserId;
+            return $"bot_{player.PlayerId}_{player.Nickname ?? "Dummy"}";
+        }
+
+        public Player GetPlayerById(int playerId)
+        {
+            if (playerId <= 0)
+                return null;
+
+            if (Player.TryGet(playerId, out Player byId) && byId != null && !byId.IsDestroyed)
+                return byId;
+
+            foreach (Player candidate in Player.List)
+            {
+                if (candidate != null && !candidate.IsDestroyed && candidate.PlayerId == playerId)
+                    return candidate;
+            }
+
+            return null;
+        }
+
+        private int GetPlayerWins(Player player)
+        {
+            string key = GetStatsKey(player);
+            if (string.IsNullOrEmpty(key))
                 return 0;
-            int next = GetPlayerWins(userId) + 1;
-            _playerWins[userId] = next;
+            return _playerWins.TryGetValue(key, out int w) ? w : 0;
+        }
+
+        private int IncrementPlayerWins(Player player)
+        {
+            string key = GetStatsKey(player);
+            if (string.IsNullOrEmpty(key))
+                return 0;
+            int next = GetPlayerWins(player) + 1;
+            _playerWins[key] = next;
             return next;
         }
 
@@ -620,12 +673,12 @@ namespace Arena1v1
         /// </summary>
         private int TryRecordMatchInArenaStats(Player winner, Player loser, string loadoutSetName, int xpAwarded)
         {
-            string winnerId = winner != null ? winner.UserId : string.Empty;
+            string winnerId = GetStatsKey(winner);
             string winnerName = winner != null ? winner.Nickname : "Player";
-            string loserId = loser != null ? loser.UserId : string.Empty;
+            string loserId = GetStatsKey(loser);
             string loserName = loser != null ? loser.Nickname : "Opponent";
 
-            int sessionWins = IncrementPlayerWins(winnerId);
+            int sessionWins = IncrementPlayerWins(winner);
             if (!Config.EnableStatsRecording)
                 return sessionWins;
 
@@ -753,6 +806,40 @@ namespace Arena1v1
             return chosen;
         }
 
+        public bool InspectArenaPool(out string response)
+        {
+            CleanupInvalidParticipants();
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.AppendLine($"[RA - Arena1v1] Pool Size: {_arenaParticipants.Count}");
+            if (_activeDuel != null)
+            {
+                Player p1 = GetPlayerById(_activeDuel.Player1Id);
+                Player p2 = GetPlayerById(_activeDuel.Player2Id);
+                string p1Str = p1 != null ? $"{p1.Nickname} (ID:{p1.PlayerId})" : $"ID:{_activeDuel.Player1Id}";
+                string p2Str = p2 != null ? $"{p2.Nickname} (ID:{p2.PlayerId})" : (_activeDuel.IsSoloSession ? "SOLO" : $"ID:{_activeDuel.Player2Id}");
+                string kitStr = _activeDuel.CurrentLoadout != null ? _activeDuel.CurrentLoadout.Name : "Standard Kit";
+                sb.AppendLine($"Active Duel (Round #{_activeDuel.CurrentRound}, Kit: {kitStr}): {p1Str} vs {p2Str}");
+            }
+            else
+            {
+                sb.AppendLine("Active Duel: None");
+            }
+
+            for (int i = 0; i < _arenaParticipants.Count; i++)
+            {
+                int pid = _arenaParticipants[i];
+                Player p = GetPlayerById(pid);
+                string name = p != null ? p.Nickname : "Offline";
+                string role = p != null ? p.Role.ToString() : "None";
+                bool isFighting = _activeDuel != null && (pid == _activeDuel.Player1Id || pid == _activeDuel.Player2Id);
+                string stateTag = isFighting ? "FIGHTING" : "WAITING IN QUEUE";
+                sb.AppendLine($"  {i + 1}. [ID:{pid}] {name} ({role}) - {stateTag}");
+            }
+
+            response = sb.ToString();
+            return true;
+        }
+
         public bool ListConfiguredKits(out string response)
         {
             List<ArenaLoadoutSet> kits = Config.LoadoutKits != null && Config.LoadoutKits.Count > 0
@@ -813,7 +900,7 @@ namespace Arena1v1
             if (_activeDuel != null)
             {
                 _activeDuel.CurrentLoadout = chosen;
-                if (_activeDuel.IsSoloSession && player != null && _activeDuel.Player1UserId == player.UserId)
+                if (_activeDuel.IsSoloSession && player != null && _activeDuel.Player1Id == player.PlayerId)
                 {
                     SpawnSingleFighterOnArena(player, 1, _activeDuel.CurrentRound, chosen);
                 }
@@ -828,21 +915,22 @@ namespace Arena1v1
             if (_activeDuel != null)
             {
                 Timing.KillCoroutines(_activeDuel.RematchCoroutine);
-                Player p1 = Player.Get(_activeDuel.Player1UserId);
-                Player p2 = Player.Get(_activeDuel.Player2UserId);
+                Player p1 = GetPlayerById(_activeDuel.Player1Id);
+                Player p2 = GetPlayerById(_activeDuel.Player2Id);
                 _activeDuel = null;
                 if (p1 != null && !p1.IsDestroyed) ReturnPlayerToSpectator(p1);
                 if (p2 != null && !p2.IsDestroyed) ReturnPlayerToSpectator(p2);
             }
 
-            foreach (string uid in _arenaParticipants)
+            foreach (int pid in _arenaParticipants)
             {
-                Player p = Player.Get(uid);
+                Player p = GetPlayerById(pid);
                 if (p != null && !p.IsDestroyed)
                     ReturnPlayerToSpectator(p);
             }
 
             _arenaParticipants.Clear();
+            _forceAddedParticipants.Clear();
             CleanupDroppedArenaPickups();
             RestoreServerFriendlyFire();
 
@@ -855,7 +943,7 @@ namespace Arena1v1
         /// </summary>
         private bool TryAwardXpSystemReward(Player target, int xpAmount, string reason)
         {
-            if (!Config.EnableXpRewards || target == null || target.IsDestroyed || xpAmount <= 0)
+            if (!Config.EnableXpRewards || target == null || target.IsDestroyed || IsBotOrDummy(target) || xpAmount <= 0)
                 return false;
 
             try
@@ -896,21 +984,51 @@ namespace Arena1v1
             return false;
         }
 
+        /// <summary>
+        /// Finds a player or bot by ID (#2 or 2), keyword ("me", "bot", "dummy"), UserId, or Nickname.
+        /// When multiple bots share the same nickname, prefers a bot not yet in _arenaParticipants.
+        /// </summary>
         public Player FindTargetPlayer(string query, Player caller)
         {
             if (string.IsNullOrWhiteSpace(query))
                 return null;
 
             string trimmed = query.Trim();
+            if (trimmed.StartsWith("#") && trimmed.Length > 1)
+                trimmed = trimmed.Substring(1);
+
             if (string.Equals(trimmed, "me", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(trimmed, "self", StringComparison.OrdinalIgnoreCase))
             {
                 return caller;
             }
 
-            if (int.TryParse(trimmed, out int pid) && Player.TryGet(pid, out Player byId) && byId != null && !byId.IsDestroyed)
+            if (int.TryParse(trimmed, out int pid))
             {
-                return byId;
+                Player byPid = GetPlayerById(pid);
+                if (byPid != null)
+                    return byPid;
+            }
+
+            if (string.Equals(trimmed, "bot", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(trimmed, "dummy", StringComparison.OrdinalIgnoreCase))
+            {
+                Player fallbackBot = null;
+                foreach (Player candidate in Player.List)
+                {
+                    if (candidate == null || candidate.IsDestroyed || candidate == caller)
+                        continue;
+
+                    if (IsBotOrDummy(candidate))
+                    {
+                        if (!_arenaParticipants.Contains(candidate.PlayerId))
+                            return candidate;
+                        if (fallbackBot == null)
+                            fallbackBot = candidate;
+                    }
+                }
+                if (fallbackBot != null)
+                    return fallbackBot;
             }
 
             if (Player.TryGet(trimmed, out Player byUserId) && byUserId != null && !byUserId.IsDestroyed)
@@ -918,29 +1036,33 @@ namespace Arena1v1
                 return byUserId;
             }
 
-            Player exactNick = Player.GetByNickname(trimmed, false);
-            if (exactNick != null && !exactNick.IsDestroyed)
-            {
-                return exactNick;
-            }
-
+            // First pass: look for a nickname match that is NOT yet in _arenaParticipants (ideal for multiple bots named "Dummy")
+            Player firstAlreadyInPool = null;
             foreach (Player candidate in Player.List)
             {
-                if (candidate != null && !candidate.IsDestroyed &&
-                    !string.IsNullOrEmpty(candidate.Nickname) &&
+                if (candidate == null || candidate.IsDestroyed || string.IsNullOrEmpty(candidate.Nickname))
+                    continue;
+
+                if (string.Equals(candidate.Nickname, trimmed, StringComparison.OrdinalIgnoreCase) ||
                     candidate.Nickname.IndexOf(trimmed, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    return candidate;
+                    if (!_arenaParticipants.Contains(candidate.PlayerId))
+                        return candidate;
+
+                    if (firstAlreadyInPool == null)
+                        firstAlreadyInPool = candidate;
                 }
             }
 
-            return null;
+            return firstAlreadyInPool;
         }
 
         public bool StartOrJoinSoloArena(Player player, out string response)
         {
-            if (!_arenaParticipants.Contains(player.UserId))
-                _arenaParticipants.Add(player.UserId);
+            int pid = player.PlayerId;
+            _forceAddedParticipants.Add(pid);
+            if (!_arenaParticipants.Contains(pid))
+                _arenaParticipants.Add(pid);
 
             EnsureArenaSchematicSpawned();
             EnableArenaFriendlyFire();
@@ -951,21 +1073,25 @@ namespace Arena1v1
             {
                 _activeDuel = new ActiveDuelSession
                 {
-                    Player1UserId = player.UserId,
+                    Player1Id = pid,
+                    Player2Id = -1,
+                    Player1UserId = GetStatsKey(player),
                     Player2UserId = string.Empty,
                     CurrentRound = 1,
+                    RoundStartTime = Time.realtimeSinceStartup,
                     IsRespawningBetweenRounds = false,
                     CurrentLoadout = loadout
                 };
 
                 SpawnSingleFighterOnArena(player, 1, _activeDuel.CurrentRound, loadout);
-                response = $"[RA - Arena1v1] {player.Nickname} spawned on the arena in solo mode ({loadout.Name}).";
+                response = $"[RA - Arena1v1] {player.Nickname} (ID:{pid}) spawned on the arena in solo mode ({loadout.Name}).";
                 return true;
             }
 
-            if (_activeDuel.IsSoloSession && _activeDuel.Player1UserId == player.UserId)
+            if (_activeDuel.IsSoloSession && _activeDuel.Player1Id == pid)
             {
                 _activeDuel.CurrentRound++;
+                _activeDuel.RoundStartTime = Time.realtimeSinceStartup;
                 _activeDuel.CurrentLoadout = loadout;
                 CleanupDroppedArenaPickups();
                 SpawnSingleFighterOnArena(player, 1, _activeDuel.CurrentRound, loadout);
@@ -973,80 +1099,111 @@ namespace Arena1v1
                 return true;
             }
 
-            if (_activeDuel.IsSoloSession && _activeDuel.Player1UserId != player.UserId)
+            if (_activeDuel.IsSoloSession && _activeDuel.Player1Id != pid)
             {
-                Player p1 = Player.Get(_activeDuel.Player1UserId);
+                Player p1 = GetPlayerById(_activeDuel.Player1Id);
                 if (p1 == null || p1.IsDestroyed)
                 {
-                    _activeDuel.Player1UserId = player.UserId;
+                    _activeDuel.Player1Id = pid;
+                    _activeDuel.Player1UserId = GetStatsKey(player);
+                    _activeDuel.RoundStartTime = Time.realtimeSinceStartup;
                     _activeDuel.CurrentLoadout = loadout;
                     SpawnSingleFighterOnArena(player, 1, 1, loadout);
-                    response = $"[RA - Arena1v1] {player.Nickname} spawned on the arena ({loadout.Name}).";
+                    response = $"[RA - Arena1v1] {player.Nickname} (ID:{pid}) spawned on the arena ({loadout.Name}).";
                     return true;
                 }
 
-                _activeDuel.Player2UserId = player.UserId;
+                _activeDuel.Player2Id = pid;
+                _activeDuel.Player2UserId = GetStatsKey(player);
                 _activeDuel.CurrentRound = 1;
+                _activeDuel.RoundStartTime = Time.realtimeSinceStartup;
                 _activeDuel.CurrentLoadout = loadout;
                 SpawnBothFightersOnArena(p1, player, _activeDuel);
-                response = $"[RA - Arena1v1] Duel started: {p1.Nickname} vs {player.Nickname} ({loadout.Name})!";
+                response = $"[RA - Arena1v1] Duel started: {p1.Nickname} (ID:{p1.PlayerId}) vs {player.Nickname} (ID:{pid}) ({loadout.Name})!";
                 return true;
             }
 
-            response = $"[RA - Arena1v1] {player.Nickname} added to the arena pool (Pool size: {_arenaParticipants.Count}).";
+            response = $"[RA - Arena1v1] {player.Nickname} (ID:{pid}) added to the arena pool (Pool size: {_arenaParticipants.Count}).";
             return true;
         }
 
         public bool ForceAddPlayerToArena(Player target, out string response)
         {
-            if (!_arenaParticipants.Contains(target.UserId))
-                _arenaParticipants.Add(target.UserId);
+            int targetId = target.PlayerId;
+            _forceAddedParticipants.Add(targetId);
+
+            CleanupInvalidParticipants();
+
+            if (!_arenaParticipants.Contains(targetId))
+                _arenaParticipants.Add(targetId);
 
             EnsureArenaSchematicSpawned();
             EnableArenaFriendlyFire();
 
             ArenaLoadoutSet loadout = PickRoundLoadoutSet();
 
+            // Case 1: No active duel yet
             if (_activeDuel == null)
             {
+                if (_arenaParticipants.Count >= 2)
+                {
+                    StartNextRandomRoundFromPool(1);
+                    response = $"[RA - Arena1v1] Player {target.Nickname} (ID:{targetId}) added. 2 participants ready - 1v1 duel started!";
+                    return true;
+                }
+
                 _activeDuel = new ActiveDuelSession
                 {
-                    Player1UserId = target.UserId,
+                    Player1Id = targetId,
+                    Player2Id = -1,
+                    Player1UserId = GetStatsKey(target),
                     Player2UserId = string.Empty,
                     CurrentRound = 1,
+                    RoundStartTime = Time.realtimeSinceStartup,
                     IsRespawningBetweenRounds = false,
                     CurrentLoadout = loadout
                 };
 
                 SpawnSingleFighterOnArena(target, 1, 1, loadout);
-                response = $"[RA - Arena1v1] Player {target.Nickname} teleported to the arena ({loadout.Name}).";
+                response = $"[RA - Arena1v1] Player {target.Nickname} (ID:{targetId}) teleported to the arena ({loadout.Name}). Add a 2nd player/bot to start 1v1.";
                 return true;
             }
 
-            if (_activeDuel.IsSoloSession && _activeDuel.Player1UserId != target.UserId)
+            // Case 2: 1 player/bot is currently waiting on the arena in solo mode -> immediately start 1v1 against them!
+            if (_activeDuel.IsSoloSession && _activeDuel.Player1Id != targetId)
             {
-                Player p1 = Player.Get(_activeDuel.Player1UserId);
+                Player p1 = GetPlayerById(_activeDuel.Player1Id);
                 if (p1 == null || p1.IsDestroyed)
                 {
-                    _activeDuel.Player1UserId = target.UserId;
+                    _activeDuel.Player1Id = targetId;
+                    _activeDuel.Player1UserId = GetStatsKey(target);
+                    _activeDuel.RoundStartTime = Time.realtimeSinceStartup;
                     _activeDuel.CurrentLoadout = loadout;
                     SpawnSingleFighterOnArena(target, 1, 1, loadout);
-                    response = $"[RA - Arena1v1] Player {target.Nickname} teleported to the arena ({loadout.Name}).";
+                    response = $"[RA - Arena1v1] Player {target.Nickname} (ID:{targetId}) teleported to the arena ({loadout.Name}).";
                     return true;
                 }
 
-                _activeDuel.Player2UserId = target.UserId;
+                _activeDuel.Player2Id = targetId;
+                _activeDuel.Player2UserId = GetStatsKey(target);
                 _activeDuel.CurrentRound = 1;
+                _activeDuel.RoundStartTime = Time.realtimeSinceStartup;
                 _activeDuel.CurrentLoadout = loadout;
                 SpawnBothFightersOnArena(p1, target, _activeDuel);
-                response = $"[RA - Arena1v1] Player {target.Nickname} matched against {p1.Nickname}! 1v1 duel started.";
+                response = $"[RA - Arena1v1] Player {target.Nickname} (ID:{targetId}) matched against {p1.Nickname} (ID:{p1.PlayerId})! 1v1 duel started.";
                 return true;
             }
 
-            response = $"[RA - Arena1v1] Player {target.Nickname} added to the arena pool ({_arenaParticipants.Count} players). They will rotate in next round.";
+            // Case 3: 2 fighters are already dueling -> place 3rd+ player/bot on the waiting bench for the next round!
+            if (_activeDuel.Player1Id != targetId && _activeDuel.Player2Id != targetId)
+            {
+                MoveParticipantToBench(target);
+            }
+
+            response = $"[RA - Arena1v1] Player {target.Nickname} (ID:{targetId}) added to the arena pool ({_arenaParticipants.Count} in pool). They will rotate in next round.";
             target.SendHint(
                 $"<color=#00F0FF><b>[1v1 Arena]</b></color> You have been added to the arena pool (<b>{_arenaParticipants.Count}</b> players).\n" +
-                "Two fighters are selected randomly each round.",
+                "You will automatically spawn in the next round!",
                 Config.HintDurationSeconds
             );
             return true;
@@ -1059,7 +1216,20 @@ namespace Arena1v1
                 ? _activeDuel.CurrentLoadout.Name
                 : "Standard Kit";
 
-            int totalWins = TryRecordMatchInArenaStats(player, null, currentSetName, cfg.WinXpReward);
+            Player loser = null;
+            if (_activeDuel != null && !_activeDuel.IsSoloSession)
+            {
+                int loserId = _activeDuel.Player1Id == player.PlayerId ? _activeDuel.Player2Id : _activeDuel.Player1Id;
+                loser = GetPlayerById(loserId);
+                _activeDuel.LastWinnerId = player.PlayerId;
+                _activeDuel.LastLoserId = loserId;
+                if (loserId > 0 && _arenaParticipants.Remove(loserId))
+                {
+                    _arenaParticipants.Add(loserId);
+                }
+            }
+
+            int totalWins = TryRecordMatchInArenaStats(player, loser, currentSetName, cfg.WinXpReward);
             string xpReason = $"{cfg.WinXpReason} (Wins: {totalWins})";
             bool xpAwarded = TryAwardXpSystemReward(player, cfg.WinXpReward, xpReason);
 
@@ -1073,6 +1243,8 @@ namespace Arena1v1
 
             if (_activeDuel != null)
             {
+                Timing.KillCoroutines(_activeDuel.RematchCoroutine);
+                _activeDuel.IsRespawningBetweenRounds = false;
                 _activeDuel.CurrentRound++;
                 CleanupDroppedArenaPickups();
                 if (_activeDuel.IsSoloSession && _arenaParticipants.Count < 2)
@@ -1137,21 +1309,22 @@ namespace Arena1v1
         /// <summary>
         /// Handles player .arena toggle:
         /// - If already in the pool or fighting -> removes player and sets role to Spectator.
-        /// - If joining as Spectator:
+        /// - If joining:
         ///   * Starts duel immediately when 2 players are ready and no duel is active.
-        ///   * If 2 players are already fighting and a 3rd+ player types .arena, adds them to the rotation pool.
+        ///   * If 2 players/bots are already fighting and a 3rd+ player types .arena, adds them to the rotation pool.
         /// </summary>
         public bool ToggleArenaParticipation(Player player, out string response)
         {
             ArenaConfig cfg = Config;
-            string userId = player.UserId;
+            int pid = player.PlayerId;
 
             bool isCurrentlyFighting = _activeDuel != null &&
-                                       (_activeDuel.Player1UserId == userId || _activeDuel.Player2UserId == userId);
+                                       (_activeDuel.Player1Id == pid || _activeDuel.Player2Id == pid);
 
-            if (_arenaParticipants.Contains(userId) || isCurrentlyFighting)
+            if (_arenaParticipants.Contains(pid) || isCurrentlyFighting)
             {
-                _arenaParticipants.Remove(userId);
+                _arenaParticipants.Remove(pid);
+                _forceAddedParticipants.Remove(pid);
 
                 if (isCurrentlyFighting)
                 {
@@ -1165,7 +1338,8 @@ namespace Arena1v1
                 return true;
             }
 
-            if (cfg.OnlySpectatorsCanJoin && !IsSpectatorRole(player.Role))
+            bool allowedRole = IsSpectatorRole(player.Role) || player.Role == RoleTypeId.Tutorial || player.Role == cfg.DuelRole;
+            if (cfg.OnlySpectatorsCanJoin && !allowedRole)
             {
                 player.SendHint(
                     "<color=#F87171><b>[1v1 Arena]</b></color> You can only join <b>.arena</b> while in the <b>Spectator</b> role!",
@@ -1182,9 +1356,9 @@ namespace Arena1v1
                 return false;
             }
 
-            _arenaParticipants.Add(userId);
+            _arenaParticipants.Add(pid);
 
-            if (_activeDuel != null && _activeDuel.IsSoloSession && _activeDuel.Player1UserId != userId)
+            if (_activeDuel != null && _activeDuel.IsSoloSession && _activeDuel.Player1Id != pid)
             {
                 StartNextRandomRoundFromPool(1);
                 response = "[1v1 Arena] Opponent found - teleporting to the arena!";
@@ -1203,12 +1377,12 @@ namespace Arena1v1
                 int totalInPool = _arenaParticipants.Count;
                 player.SendHint(
                     $"<color=#00F0FF><b>[1v1 Arena]</b></color> Added to the arena rotation pool (<b>{totalInPool}</b> players)!\n" +
-                    "Two fighters are chosen randomly after the current round. Type <b>.arena</b> again to leave.",
+                    "You will automatically rotate into the next round. Type <b>.arena</b> again to leave.",
                     cfg.HintDurationSeconds
                 );
 
-                Player f1 = Player.Get(_activeDuel.Player1UserId);
-                Player f2 = Player.Get(_activeDuel.Player2UserId);
+                Player f1 = GetPlayerById(_activeDuel.Player1Id);
+                Player f2 = GetPlayerById(_activeDuel.Player2Id);
                 string joinNotice = $"<color=#34D399>[1v1 Arena]</color> <b>{player.Nickname}</b> joined the arena pool (<b>{totalInPool}</b> players).";
                 if (f1 != null && !f1.IsDestroyed) f1.SendHint(joinNotice, 3.5f);
                 if (f2 != null && !f2.IsDestroyed) f2.SendHint(joinNotice, 3.5f);
@@ -1219,7 +1393,7 @@ namespace Arena1v1
 
             player.SendHint(
                 "<color=#00F0FF>[1v1 Arena]</color> You are queued in the arena pool (1/2).\n" +
-                "Match starts as soon as a 2nd Spectator joins. Type <b>.arena</b> again to cancel.",
+                "Match starts as soon as a 2nd participant joins. Type <b>.arena</b> again to cancel.",
                 cfg.HintDurationSeconds
             );
             response = "[1v1 Arena] Added to queue (1/2). Type .arena again to leave.";
@@ -1228,26 +1402,22 @@ namespace Arena1v1
 
         private void CleanupInvalidParticipants()
         {
-            ArenaConfig cfg = Config;
-            _arenaParticipants.RemoveAll(id =>
+            _arenaParticipants.RemoveAll(pid =>
             {
-                Player p = Player.Get(id);
+                Player p = GetPlayerById(pid);
                 if (p == null || p.IsDestroyed)
+                {
+                    _forceAddedParticipants.Remove(pid);
                     return true;
-
-                bool isFightingNow = _activeDuel != null &&
-                                     (_activeDuel.Player1UserId == id || _activeDuel.Player2UserId == id);
-
-                if (!isFightingNow && cfg.OnlySpectatorsCanJoin && !IsSpectatorRole(p.Role))
-                    return true;
-
+                }
                 return false;
             });
         }
 
         /// <summary>
-        /// Selects 2 fighters from _arenaParticipants (prioritizing bench players when 3+ players are in the pool),
-        /// moves non-selected participants to Spectator, and spawns the chosen pair with a random loadout kit.
+        /// Selects 2 fighters from _arenaParticipants in fair FIFO bench order:
+        /// - Any player/bot who waited on the bench in the previous round is guaranteed to rotate in!
+        /// - Pairs the waiting bench player against a 2nd waiting player or the winner of the previous round.
         /// </summary>
         private void StartNextRandomRoundFromPool(int nextRoundNumber)
         {
@@ -1255,17 +1425,17 @@ namespace Arena1v1
 
             if (_arenaParticipants.Count < 2)
             {
-                string prevP1 = _activeDuel != null ? _activeDuel.Player1UserId : string.Empty;
-                string prevP2 = _activeDuel != null ? _activeDuel.Player2UserId : string.Empty;
+                int prevP1 = _activeDuel != null ? _activeDuel.Player1Id : -1;
+                int prevP2 = _activeDuel != null ? _activeDuel.Player2Id : -1;
                 _activeDuel = null;
                 RestoreServerFriendlyFire();
 
-                foreach (string uid in _arenaParticipants)
+                foreach (int pid in _arenaParticipants)
                 {
-                    Player waitPlayer = Player.Get(uid);
+                    Player waitPlayer = GetPlayerById(pid);
                     if (waitPlayer != null && !waitPlayer.IsDestroyed)
                     {
-                        ReturnPlayerToSpectator(waitPlayer);
+                        MoveParticipantToBench(waitPlayer);
                         waitPlayer.SendHint(
                             "<color=#FACC15>[1v1 Arena]</color> Waiting for a second opponent (1/2).\n" +
                             "Type <b>.arena</b> again to leave.",
@@ -1274,67 +1444,69 @@ namespace Arena1v1
                     }
                 }
 
-                if (!string.IsNullOrEmpty(prevP1) && !_arenaParticipants.Contains(prevP1))
+                if (prevP1 > 0 && !_arenaParticipants.Contains(prevP1))
                 {
-                    Player p1Old = Player.Get(prevP1);
+                    Player p1Old = GetPlayerById(prevP1);
                     if (p1Old != null && !p1Old.IsDestroyed) ReturnPlayerToSpectator(p1Old);
                 }
-                if (!string.IsNullOrEmpty(prevP2) && !_arenaParticipants.Contains(prevP2))
+                if (prevP2 > 0 && !_arenaParticipants.Contains(prevP2))
                 {
-                    Player p2Old = Player.Get(prevP2);
+                    Player p2Old = GetPlayerById(prevP2);
                     if (p2Old != null && !p2Old.IsDestroyed) ReturnPlayerToSpectator(p2Old);
                 }
                 return;
             }
 
-            string lastP1 = _activeDuel != null ? _activeDuel.Player1UserId : string.Empty;
-            string lastP2 = _activeDuel != null ? _activeDuel.Player2UserId : string.Empty;
+            int lastP1 = _activeDuel != null ? _activeDuel.Player1Id : -1;
+            int lastP2 = _activeDuel != null ? _activeDuel.Player2Id : -1;
+            int lastWinner = _activeDuel != null ? _activeDuel.LastWinnerId : -1;
 
-            List<string> waitingBench = new List<string>();
-            List<string> previousFighters = new List<string>();
+            List<int> waitingBench = new List<int>();
+            List<int> previousFighters = new List<int>();
 
-            foreach (string uid in _arenaParticipants)
+            for (int i = 0; i < _arenaParticipants.Count; i++)
             {
-                if (uid == lastP1 || uid == lastP2)
-                    previousFighters.Add(uid);
+                int pid = _arenaParticipants[i];
+                if (pid == lastP1 || pid == lastP2)
+                    previousFighters.Add(pid);
                 else
-                    waitingBench.Add(uid);
+                    waitingBench.Add(pid);
             }
 
-            string chosenP1Id;
-            string chosenP2Id;
+            int chosenP1Id;
+            int chosenP2Id;
 
             if (Config.PrioritizeWaitingBenchPlayers && waitingBench.Count >= 2)
             {
-                int idx1 = _rng.Next(waitingBench.Count);
-                chosenP1Id = waitingBench[idx1];
-                waitingBench.RemoveAt(idx1);
-                int idx2 = _rng.Next(waitingBench.Count);
-                chosenP2Id = waitingBench[idx2];
+                // Pick the first 2 waiting players from the FIFO bench queue
+                chosenP1Id = waitingBench[0];
+                chosenP2Id = waitingBench[1];
             }
             else if (Config.PrioritizeWaitingBenchPlayers && waitingBench.Count == 1)
             {
+                // Guarantee the waiting 3rd player/bot enters the arena!
                 chosenP1Id = waitingBench[0];
-                chosenP2Id = previousFighters[_rng.Next(previousFighters.Count)];
-                if (_rng.Next(2) == 1)
+                if (lastWinner > 0 && previousFighters.Contains(lastWinner))
                 {
-                    string tmp = chosenP1Id;
-                    chosenP1Id = chosenP2Id;
-                    chosenP2Id = tmp;
+                    chosenP2Id = lastWinner;
+                }
+                else if (previousFighters.Count > 0)
+                {
+                    chosenP2Id = previousFighters[0];
+                }
+                else
+                {
+                    chosenP2Id = _arenaParticipants[0] != chosenP1Id ? _arenaParticipants[0] : _arenaParticipants[1];
                 }
             }
             else
             {
-                List<string> poolCopy = new List<string>(_arenaParticipants);
-                int idx1 = _rng.Next(poolCopy.Count);
-                chosenP1Id = poolCopy[idx1];
-                poolCopy.RemoveAt(idx1);
-                int idx2 = _rng.Next(poolCopy.Count);
-                chosenP2Id = poolCopy[idx2];
+                chosenP1Id = _arenaParticipants[0];
+                chosenP2Id = _arenaParticipants[1];
             }
 
-            Player p1 = Player.Get(chosenP1Id);
-            Player p2 = Player.Get(chosenP2Id);
+            Player p1 = GetPlayerById(chosenP1Id);
+            Player p2 = GetPlayerById(chosenP2Id);
 
             if (p1 == null || p1.IsDestroyed || p2 == null || p2.IsDestroyed)
             {
@@ -1347,32 +1519,37 @@ namespace Arena1v1
 
             ArenaLoadoutSet roundLoadout = PickRoundLoadoutSet();
 
-            foreach (string uid in _arenaParticipants)
+            // Set _activeDuel BEFORE moving bench players or changing roles so OnPlayerChangedRole knows who is fighting
+            _activeDuel = new ActiveDuelSession
             {
-                if (uid == chosenP1Id || uid == chosenP2Id)
+                Player1Id = p1.PlayerId,
+                Player2Id = p2.PlayerId,
+                Player1UserId = GetStatsKey(p1),
+                Player2UserId = GetStatsKey(p2),
+                CurrentRound = nextRoundNumber,
+                RoundStartTime = Time.realtimeSinceStartup,
+                IsRespawningBetweenRounds = false,
+                CurrentLoadout = roundLoadout
+            };
+
+            for (int i = 0; i < _arenaParticipants.Count; i++)
+            {
+                int pid = _arenaParticipants[i];
+                if (pid == chosenP1Id || pid == chosenP2Id)
                     continue;
 
-                Player benchPlayer = Player.Get(uid);
+                Player benchPlayer = GetPlayerById(pid);
                 if (benchPlayer != null && !benchPlayer.IsDestroyed)
                 {
-                    ReturnPlayerToSpectator(benchPlayer);
+                    MoveParticipantToBench(benchPlayer);
                     benchPlayer.SendHint(
                         $"<color=#00F0FF><b>[1v1 Arena - Round #{nextRoundNumber}]</b></color>\n" +
                         $"Fighting now: <color=#38BDF8>{p1.Nickname}</color> vs <color=#FB7185>{p2.Nickname}</color> (<b>{roundLoadout.Name}</b>)\n" +
-                        $"<size=75%>You are in the pool ({_arenaParticipants.Count} players) and will rotate in next round.</size>",
+                        $"<size=75%>You are next in the pool ({_arenaParticipants.Count} players) and will rotate in next round.</size>",
                         Config.HintDurationSeconds
                     );
                 }
             }
-
-            _activeDuel = new ActiveDuelSession
-            {
-                Player1UserId = p1.UserId,
-                Player2UserId = p2.UserId,
-                CurrentRound = nextRoundNumber,
-                IsRespawningBetweenRounds = false,
-                CurrentLoadout = roundLoadout
-            };
 
             SpawnBothFightersOnArena(p1, p2, _activeDuel);
         }
@@ -1467,12 +1644,13 @@ namespace Arena1v1
 
             ArenaLoadoutSet loadout = session.CurrentLoadout ?? PickRoundLoadoutSet();
             session.CurrentLoadout = loadout;
+            session.RoundStartTime = Time.realtimeSinceStartup;
 
             TeleportAndEquipFighter(p1, cfg.DuelRole, p1Pos, p1Yaw, loadout);
             TeleportAndEquipFighter(p2, cfg.DuelRole, p2Pos, p2Yaw, loadout);
 
-            int p1Wins = GetPlayerWins(p1.UserId);
-            int p2Wins = GetPlayerWins(p2.UserId);
+            int p1Wins = GetPlayerWins(p1);
+            int p2Wins = GetPlayerWins(p2);
 
             string banner =
                 $"<color=#00F0FF><b>[1v1 Arena - Round #{session.CurrentRound}]</b></color> - Kit: <color=#FACC15><b>{loadout.Name}</b></color>\n" +
@@ -1492,11 +1670,26 @@ namespace Arena1v1
             ArenaLoadoutSet loadout
         )
         {
+            if (fighter == null || fighter.IsDestroyed)
+                return;
+
             ArenaConfig cfg = Config;
             if (fighter.Role != targetRole)
             {
-                fighter.SetRole(targetRole, RoleChangeReason.Respawn, RoleSpawnFlags.None);
+                fighter.SetRole(targetRole, RoleChangeReason.RemoteAdmin, RoleSpawnFlags.None);
             }
+
+            // Immediately move out of the Spectator void (Y = -1998) on the same frame so void death never triggers
+            fighter.Position = worldPos;
+            fighter.Rotation = Quaternion.Euler(0f, yawDegrees, 0f);
+
+            Timing.CallDelayed(0.05f, () =>
+            {
+                if (fighter == null || fighter.IsDestroyed)
+                    return;
+                fighter.Position = worldPos;
+                fighter.Rotation = Quaternion.Euler(0f, yawDegrees, 0f);
+            });
 
             float delay = cfg.EquipDelaySeconds > 0f ? cfg.EquipDelaySeconds : 0.15f;
             Timing.CallDelayed(delay, () =>
@@ -1545,28 +1738,43 @@ namespace Arena1v1
 
         private void OnPlayerHurting(PlayerHurtingEventArgs ev)
         {
-            if (ev.Player == null || ev.Attacker == null || ev.Player == ev.Attacker)
+            if (ev.Player == null)
                 return;
 
             if (_activeDuel != null)
             {
-                string victimId = ev.Player.UserId;
-                string attackerId = ev.Attacker.UserId;
+                int victimId = ev.Player.PlayerId;
+                bool victimInDuel = victimId == _activeDuel.Player1Id || victimId == _activeDuel.Player2Id;
 
-                bool victimInDuel = victimId == _activeDuel.Player1UserId || victimId == _activeDuel.Player2UserId;
-                bool attackerInDuel = attackerId == _activeDuel.Player1UserId || attackerId == _activeDuel.Player2UserId;
-
-                if (victimInDuel && attackerInDuel && victimId != attackerId)
+                // Protect newly spawned arena fighters from Spectator void/fall damage during role transition
+                if (victimInDuel && (ev.Attacker == null || ev.Attacker == ev.Player) &&
+                    (Time.realtimeSinceStartup - _activeDuel.RoundStartTime) < 1.5f)
                 {
-                    ev.IsAllowed = true;
-                    StandardDamageHandler stdDamage = ev.DamageHandler as StandardDamageHandler;
-                    if (stdDamage != null && stdDamage.Damage > 0f && stdDamage.Damage < 15f)
-                    {
-                        stdDamage.Damage *= Config.LowDamageCompensationMultiplier;
-                    }
+                    ev.IsAllowed = false;
                     return;
                 }
+
+                if (ev.Attacker != null && ev.Player != ev.Attacker)
+                {
+                    int attackerId = ev.Attacker.PlayerId;
+                    bool attackerInDuel = attackerId == _activeDuel.Player1Id || attackerId == _activeDuel.Player2Id;
+                    bool attackerInPool = _arenaParticipants.Contains(attackerId);
+
+                    if (victimInDuel && (attackerInDuel || attackerInPool) && victimId != attackerId)
+                    {
+                        ev.IsAllowed = true;
+                        StandardDamageHandler stdDamage = ev.DamageHandler as StandardDamageHandler;
+                        if (stdDamage != null && stdDamage.Damage > 0f && stdDamage.Damage < 15f)
+                        {
+                            stdDamage.Damage *= Config.LowDamageCompensationMultiplier;
+                        }
+                        return;
+                    }
+                }
             }
+
+            if (ev.Attacker == null || ev.Player == ev.Attacker)
+                return;
 
             if (_friendlyFireOverrideActive && !_wasServerFriendlyFireEnabled)
             {
@@ -1584,16 +1792,41 @@ namespace Arena1v1
             if (changedPlayer == null || changedPlayer.IsDestroyed)
                 return;
 
+            int pid = changedPlayer.PlayerId;
+
             Timing.CallDelayed(0.05f, () =>
             {
                 if (changedPlayer == null || changedPlayer.IsDestroyed)
                     return;
 
-                string userId = changedPlayer.UserId;
-                if (_activeDuel != null && (userId == _activeDuel.Player1UserId || userId == _activeDuel.Player2UserId))
+                // If an active arena fighter was killed via Remote Admin or forced to Spectator, rotate the pool!
+                if (_activeDuel != null && !_activeDuel.IsRespawningBetweenRounds &&
+                    (pid == _activeDuel.Player1Id || pid == _activeDuel.Player2Id))
+                {
+                    if (IsSpectatorRole(changedPlayer.Role))
+                    {
+                        HandleArenaFighterEliminated(changedPlayer, null);
+                    }
+                    return;
+                }
+
+                if (_activeDuel != null && (pid == _activeDuel.Player1Id || pid == _activeDuel.Player2Id))
                     return;
 
-                if (!IsSpectatorRole(changedPlayer.Role) && _arenaParticipants.Remove(userId))
+                if (!Config.RemoveFromPoolOnMainRoundSpawn)
+                    return;
+
+                if (_forceAddedParticipants.Contains(pid) || IsBotOrDummy(changedPlayer))
+                    return;
+
+                if (IsSpectatorRole(changedPlayer.Role) ||
+                    changedPlayer.Role == Config.DuelRole ||
+                    changedPlayer.Role == RoleTypeId.Tutorial)
+                {
+                    return;
+                }
+
+                if (_arenaParticipants.Remove(pid))
                 {
                     changedPlayer.SendHint("<color=#FACC15>[1v1 Arena]</color> You spawned in the main round and were removed from the arena pool.", 4f);
                 }
@@ -1605,33 +1838,71 @@ namespace Arena1v1
             if (_activeDuel == null || ev.Player == null)
                 return;
 
-            string victimId = ev.Player.UserId;
-            if (victimId != _activeDuel.Player1UserId && victimId != _activeDuel.Player2UserId)
+            int victimId = ev.Player.PlayerId;
+            if (victimId != _activeDuel.Player1Id && victimId != _activeDuel.Player2Id)
                 return;
 
-            ev.IsAllowed = false;
+            // Ignore environmental/void damage on frame 1 when transitioning out of Spectator
+            if ((ev.Attacker == null || ev.Attacker == ev.Player) &&
+                (Time.realtimeSinceStartup - _activeDuel.RoundStartTime) < 1.2f)
+            {
+                ev.IsAllowed = false;
+                ev.Player.Health = ev.Player.MaxHealth;
+                ResolveArenaSpawnPoints(out Vector3 p1Pos, out float p1Yaw, out Vector3 p2Pos, out float p2Yaw);
+                ev.Player.Position = victimId == _activeDuel.Player1Id ? p1Pos : p2Pos;
+                return;
+            }
 
-            if (_activeDuel.IsRespawningBetweenRounds)
+            ev.IsAllowed = false;
+            HandleArenaFighterEliminated(ev.Player, ev.Attacker);
+        }
+
+        private void HandleArenaFighterEliminated(Player victim, Player attacker)
+        {
+            if (_activeDuel == null || victim == null || _activeDuel.IsRespawningBetweenRounds)
+                return;
+
+            int victimId = victim.PlayerId;
+            if (victimId != _activeDuel.Player1Id && victimId != _activeDuel.Player2Id)
                 return;
 
             _activeDuel.IsRespawningBetweenRounds = true;
-            ev.Player.ClearInventory();
-            ev.Player.Health = ev.Player.MaxHealth;
+            victim.ClearInventory();
+            victim.Health = victim.MaxHealth;
 
             ArenaConfig cfg = Config;
 
-            if (_activeDuel.IsSoloSession)
+            if (_activeDuel.IsSoloSession && _arenaParticipants.Count < 2)
             {
                 _activeDuel.CurrentRound++;
                 _activeDuel.RematchCoroutine = Timing.RunCoroutine(RematchRespawnCoroutine(_activeDuel));
                 return;
             }
 
-            bool victimIsP1 = victimId == _activeDuel.Player1UserId;
-            Player p1 = Player.Get(_activeDuel.Player1UserId);
-            Player p2 = Player.Get(_activeDuel.Player2UserId);
+            bool victimIsP1 = victimId == _activeDuel.Player1Id;
+            Player p1 = GetPlayerById(_activeDuel.Player1Id);
+            Player p2 = GetPlayerById(_activeDuel.Player2Id);
             Player winner = victimIsP1 ? p2 : p1;
             Player loser = victimIsP1 ? p1 : p2;
+
+            int winnerId = winner != null ? winner.PlayerId : -1;
+            int loserId = loser != null ? loser.PlayerId : victimId;
+
+            _activeDuel.LastWinnerId = winnerId;
+            _activeDuel.LastLoserId = loserId;
+
+            // Rotate the loser to the back of the FIFO pool queue so waiting bench players enter next round
+            if (loserId > 0 && _arenaParticipants.Remove(loserId))
+            {
+                _arenaParticipants.Add(loserId);
+            }
+
+            // Immediately move the eliminated fighter off the arena when 3+ participants are in the pool
+            if (_arenaParticipants.Count >= 3 && loser != null && !loser.IsDestroyed)
+            {
+                MoveParticipantToBench(loser);
+            }
+
             string winnerName = winner != null ? winner.Nickname : "Player";
             string loadoutName = _activeDuel.CurrentLoadout != null ? _activeDuel.CurrentLoadout.Name : "Standard Kit";
 
@@ -1640,7 +1911,7 @@ namespace Arena1v1
             string winMsg =
                 $"<color=#FACC15><b>[1v1 Arena]</b></color> Round #{_activeDuel.CurrentRound} Winner: " +
                 $"<color=#34D399><b>{winnerName} (+{cfg.WinXpReward} XP | Wins: {winnerWins})</b></color>!\n" +
-                $"Next random match and kit in {cfg.RematchDelaySeconds:0.0}s...";
+                $"Next match and kit in {cfg.RematchDelaySeconds:0.0}s...";
 
             if (loser != null && !loser.IsDestroyed)
             {
@@ -1680,7 +1951,7 @@ namespace Arena1v1
 
             if (session.IsSoloSession && _arenaParticipants.Count < 2)
             {
-                Player solo = Player.Get(session.Player1UserId);
+                Player solo = GetPlayerById(session.Player1Id);
                 if (solo == null || solo.IsDestroyed)
                 {
                     HandleUnexpectedDisconnect();
@@ -1712,6 +1983,34 @@ namespace Arena1v1
             StartNextRandomRoundFromPool(nextRound);
         }
 
+        /// <summary>
+        /// Moves a waiting participant to the bench:
+        /// - Real players are switched to Spectator role.
+        /// - Bots/Dummies are disarmed and moved to a holding position outside the arena so their ReferenceHub stays active.
+        /// </summary>
+        private void MoveParticipantToBench(Player player)
+        {
+            if (player == null || player.IsDestroyed)
+                return;
+
+            player.ClearInventory();
+            if (IsBotOrDummy(player))
+            {
+                if (player.Role != Config.DuelRole)
+                {
+                    player.SetRole(Config.DuelRole, RoleChangeReason.RemoteAdmin, RoleSpawnFlags.None);
+                }
+                player.Position = Config.ArenaOrigin + new Vector3(45f, 1.5f, 0f);
+                player.Health = player.MaxHealth;
+                return;
+            }
+
+            if (player.Role != RoleTypeId.Spectator)
+            {
+                player.SetRole(RoleTypeId.Spectator, RoleChangeReason.RemoteAdmin, RoleSpawnFlags.None);
+            }
+        }
+
         private void ReturnPlayerToSpectator(Player player)
         {
             if (player == null || player.IsDestroyed)
@@ -1729,10 +2028,12 @@ namespace Arena1v1
             if (ev.Player == null)
                 return;
 
-            _arenaParticipants.Remove(ev.Player.UserId);
+            int pid = ev.Player.PlayerId;
+            _arenaParticipants.Remove(pid);
+            _forceAddedParticipants.Remove(pid);
 
             if (_activeDuel != null &&
-                (ev.Player.UserId == _activeDuel.Player1UserId || ev.Player.UserId == _activeDuel.Player2UserId))
+                (pid == _activeDuel.Player1Id || pid == _activeDuel.Player2Id))
             {
                 HandleUnexpectedDisconnect();
             }
@@ -1768,6 +2069,7 @@ namespace Arena1v1
         private void ResetOnRoundRestart()
         {
             _arenaParticipants.Clear();
+            _forceAddedParticipants.Clear();
             _playerWins.Clear();
             if (_activeDuel != null)
             {
