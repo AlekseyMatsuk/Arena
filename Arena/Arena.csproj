@@ -62,7 +62,16 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Class1.cs" />
+    <Compile Include="Main.cs" />
+    <Compile Include="RACommands.cs" />
+    <Compile Include="ClientConsolCommands.cs" />
+    <Compile Include="Config.cs" />
+    <Compile Include="Events.cs" />
+    <Compile Include="XpSystem.cs" />
+    <Compile Include="ArenaSpawner.cs" />
+    <Compile Include="Matchmaking.cs" />
+    <Compile Include="ArenaModels.cs" />
+    <Compile Include="ArenaStatsManager.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
